@@ -8,11 +8,14 @@
 (define-constant ERR_PROPOSAL_ENDED (err u106))
 (define-constant ERR_PROPOSAL_ACTIVE (err u107))
 (define-constant ERR_ALREADY_REVIEWED (err u108))
+(define-constant ERR_ACHIEVEMENT_NOT_FOUND (err u109))
+(define-constant ERR_ACHIEVEMENT_ALREADY_EARNED (err u110))
 
 (define-data-var next-tutor-id uint u1)
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-review-id uint u1)
 (define-data-var dao-treasury uint u0)
+(define-data-var next-achievement-id uint u1)
 
 (define-map tutors
   { tutor-id: uint }
@@ -150,6 +153,7 @@
     )
     
     (var-set next-review-id (+ review-id u1))
+    (try! (check-and-award-achievements tutor-id))
     (ok review-id)
   )
 )
@@ -242,6 +246,7 @@
     )
     
     (var-set dao-treasury (- (var-get dao-treasury) reward-amount))
+    (try! (check-and-award-achievements (get tutor-id proposal-data)))
     (ok true)
   )
 )
@@ -315,3 +320,111 @@
 (define-read-only (has-student-reviewed-tutor (student principal) (tutor-id uint))
   (is-some (map-get? student-tutor-reviews { student: student, tutor-id: tutor-id }))
 )
+
+
+
+
+
+(define-map achievements
+  { achievement-id: uint }
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 100),
+    requirement-type: (string-ascii 20),
+    requirement-value: uint,
+    badge-symbol: (string-ascii 10)
+  }
+)
+
+(define-map tutor-achievements
+  { tutor-id: uint, achievement-id: uint }
+  { earned-block: uint, earned-date: uint }
+)
+
+(define-map tutor-achievement-count
+  { tutor-id: uint }
+  { total-achievements: uint }
+)
+
+(define-private (initialize-achievements)
+  (begin
+    (map-set achievements { achievement-id: u1 } 
+      { name: "First Review", description: "Received your first student review", 
+        requirement-type: "review-count", requirement-value: u1, badge-symbol: "*" })
+    (map-set achievements { achievement-id: u2 } 
+      { name: "Five Star Teacher", description: "Maintained 5-star average with 10+ reviews", 
+        requirement-type: "perfect-rating", requirement-value: u10, badge-symbol: "**" })
+    (map-set achievements { achievement-id: u3 } 
+      { name: "Veteran Educator", description: "Received 50+ student reviews", 
+        requirement-type: "review-count", requirement-value: u50, badge-symbol: "^" })
+    (map-set achievements { achievement-id: u4 } 
+      { name: "Top Performer", description: "Earned 1000+ STX in rewards", 
+        requirement-type: "total-rewards", requirement-value: u1000000000, badge-symbol: "@" })
+    (var-set next-achievement-id u5)
+    (ok true)
+  )
+)
+
+(define-private (check-and-award-achievements (tutor-id uint))
+  (let
+    (
+      (tutor-data (unwrap! (map-get? tutors { tutor-id: tutor-id }) ERR_NOT_FOUND))
+      (review-count (get review-count tutor-data))
+      (total-rating (get total-rating tutor-data))
+      (total-rewards (get total-rewards tutor-data))
+      (average-rating (if (> review-count u0) (/ total-rating review-count) u0))
+    )
+    (begin
+      (if (and (>= review-count u1) 
+               (is-none (map-get? tutor-achievements { tutor-id: tutor-id, achievement-id: u1 })))
+          (unwrap-panic (award-achievement tutor-id u1))
+          true)
+      (if (and (>= review-count u10) (is-eq average-rating u5)
+               (is-none (map-get? tutor-achievements { tutor-id: tutor-id, achievement-id: u2 })))
+          (unwrap-panic (award-achievement tutor-id u2))
+          true)
+      (if (and (>= review-count u50)
+               (is-none (map-get? tutor-achievements { tutor-id: tutor-id, achievement-id: u3 })))
+          (unwrap-panic (award-achievement tutor-id u3))
+          true)
+      (if (and (>= total-rewards u1000000000)
+               (is-none (map-get? tutor-achievements { tutor-id: tutor-id, achievement-id: u4 })))
+          (unwrap-panic (award-achievement tutor-id u4))
+          true)
+      (ok true)
+    )
+  )
+)
+
+(define-private (award-achievement (tutor-id uint) (achievement-id uint))
+  (let
+    (
+      (current-count (default-to u0 (get total-achievements 
+        (map-get? tutor-achievement-count { tutor-id: tutor-id }))))
+    )
+    (map-set tutor-achievements
+      { tutor-id: tutor-id, achievement-id: achievement-id }
+      { earned-block: stacks-block-height, earned-date: stacks-block-height }
+    )
+    (map-set tutor-achievement-count
+      { tutor-id: tutor-id }
+      { total-achievements: (+ current-count u1) }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-tutor-achievements (tutor-id uint))
+  (default-to u0 (get total-achievements 
+    (map-get? tutor-achievement-count { tutor-id: tutor-id })))
+)
+
+(define-read-only (get-achievement-details (achievement-id uint))
+  (map-get? achievements { achievement-id: achievement-id })
+)
+
+(define-read-only (has-tutor-earned-achievement (tutor-id uint) (achievement-id uint))
+  (is-some (map-get? tutor-achievements { tutor-id: tutor-id, achievement-id: achievement-id }))
+)
+
+(initialize-achievements)
