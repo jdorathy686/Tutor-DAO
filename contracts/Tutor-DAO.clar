@@ -11,6 +11,11 @@
 (define-constant ERR_ACHIEVEMENT_NOT_FOUND (err u109))
 (define-constant ERR_ACHIEVEMENT_ALREADY_EARNED (err u110))
 
+(define-constant ERR_DISPUTE_WINDOW_EXPIRED (err u111))
+(define-constant ERR_DISPUTE_ALREADY_EXISTS (err u112))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u113))
+(define-constant ERR_DISPUTE_ALREADY_RESOLVED (err u114))
+
 (define-data-var next-tutor-id uint u1)
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-review-id uint u1)
@@ -427,4 +432,125 @@
   (is-some (map-get? tutor-achievements { tutor-id: tutor-id, achievement-id: achievement-id }))
 )
 
-(initialize-achievements)
+
+(define-data-var next-dispute-id uint u1)
+
+(define-map disputes
+  { dispute-id: uint }
+  {
+    review-id: uint,
+    student: principal,
+    tutor-id: uint,
+    reason: (string-ascii 200),
+    evidence: (string-ascii 300),
+    filed-block: uint,
+    resolved: bool,
+    resolution: (string-ascii 100),
+    arbitrator-votes-for: uint,
+    arbitrator-votes-against: uint,
+    resolution-block: (optional uint)
+  }
+)
+
+(define-map dispute-votes
+  { dispute-id: uint, arbitrator: principal }
+  { supports-student: bool }
+)
+
+(define-public (file-dispute (review-id uint) (reason (string-ascii 200)) (evidence (string-ascii 300)))
+  (let
+    (
+      (dispute-id (var-get next-dispute-id))
+      (caller tx-sender)
+      (review-data (unwrap! (map-get? reviews { review-id: review-id }) ERR_NOT_FOUND))
+      (dispute-window u144)
+    )
+    (asserts! (is-eq caller (get student review-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (<= (- stacks-block-height (get stacks-block-height review-data)) dispute-window) ERR_DISPUTE_WINDOW_EXPIRED)
+    (asserts! (is-none (map-get? disputes { dispute-id: dispute-id })) ERR_DISPUTE_ALREADY_EXISTS)
+    
+    (map-set disputes
+      { dispute-id: dispute-id }
+      {
+        review-id: review-id,
+        student: caller,
+        tutor-id: (get tutor-id review-data),
+        reason: reason,
+        evidence: evidence,
+        filed-block: stacks-block-height,
+        resolved: false,
+        resolution: "",
+        arbitrator-votes-for: u0,
+        arbitrator-votes-against: u0,
+        resolution-block: none
+      }
+    )
+    
+    (var-set next-dispute-id (+ dispute-id u1))
+    (ok dispute-id)
+  )
+)
+
+(define-public (arbitrate-dispute (dispute-id uint) (supports-student bool))
+  (let
+    (
+      (caller tx-sender)
+      (member-data (unwrap! (map-get? dao-members { member: caller }) ERR_NOT_AUTHORIZED))
+      (dispute-data (unwrap! (map-get? disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+      (existing-vote (map-get? dispute-votes { dispute-id: dispute-id, arbitrator: caller }))
+    )
+    (asserts! (not (get resolved dispute-data)) ERR_DISPUTE_ALREADY_RESOLVED)
+    (asserts! (is-none existing-vote) ERR_ALREADY_VOTED)
+    
+    (map-set dispute-votes
+      { dispute-id: dispute-id, arbitrator: caller }
+      { supports-student: supports-student }
+    )
+    
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute-data
+        {
+          arbitrator-votes-for: (if supports-student (+ (get arbitrator-votes-for dispute-data) u1) (get arbitrator-votes-for dispute-data)),
+          arbitrator-votes-against: (if supports-student (get arbitrator-votes-against dispute-data) (+ (get arbitrator-votes-against dispute-data) u1))
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-dispute (dispute-id uint))
+  (let
+    (
+      (dispute-data (unwrap! (map-get? disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+      (votes-for (get arbitrator-votes-for dispute-data))
+      (votes-against (get arbitrator-votes-against dispute-data))
+      (resolution-text (if (> votes-for votes-against) "Student dispute upheld" "Tutor maintained good standing"))
+    )
+    (asserts! (not (get resolved dispute-data)) ERR_DISPUTE_ALREADY_RESOLVED)
+    (asserts! (>= (+ votes-for votes-against) u3) ERR_INSUFFICIENT_BALANCE)
+    
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute-data
+        {
+          resolved: true,
+          resolution: resolution-text,
+          resolution-block: (some stacks-block-height)
+        }
+      )
+    )
+    
+    (ok (> votes-for votes-against))
+  )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes { dispute-id: dispute-id })
+)
+
+(define-read-only (get-dispute-vote (dispute-id uint) (arbitrator principal))
+  (map-get? dispute-votes { dispute-id: dispute-id, arbitrator: arbitrator })
+)
