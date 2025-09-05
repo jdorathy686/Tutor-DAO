@@ -16,6 +16,14 @@
 (define-constant ERR_DISPUTE_NOT_FOUND (err u113))
 (define-constant ERR_DISPUTE_ALREADY_RESOLVED (err u114))
 
+(define-constant ERR_SESSION_NOT_FOUND (err u115))
+(define-constant ERR_SESSION_ALREADY_COMPLETED (err u116))
+(define-constant ERR_SESSION_ALREADY_CANCELLED (err u117))
+(define-constant ERR_INSUFFICIENT_ESCROW (err u118))
+(define-constant ERR_SESSION_NOT_READY (err u119))
+
+(define-data-var next-session-id uint u1)
+
 (define-data-var next-tutor-id uint u1)
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-review-id uint u1)
@@ -553,4 +561,172 @@
 
 (define-read-only (get-dispute-vote (dispute-id uint) (arbitrator principal))
   (map-get? dispute-votes { dispute-id: dispute-id, arbitrator: arbitrator })
+)
+
+
+(define-map learning-sessions
+  { session-id: uint }
+  {
+    student: principal,
+    tutor-id: uint,
+    amount: uint,
+    description: (string-ascii 100),
+    created-block: uint,
+    completion-deadline: uint,
+    student-confirmed: bool,
+    tutor-confirmed: bool,
+    funds-released: bool,
+    cancelled: bool
+  }
+)
+
+(define-map student-session-count
+  { student: principal }
+  { total-sessions: uint, active-sessions: uint }
+)
+
+(define-public (create-learning-session (tutor-id uint) (amount uint) (description (string-ascii 100)) (session-duration-blocks uint))
+  (let
+    (
+      (session-id (var-get next-session-id))
+      (caller tx-sender)
+      (tutor-data (unwrap! (map-get? tutors { tutor-id: tutor-id }) ERR_NOT_FOUND))
+      (current-student-data (default-to { total-sessions: u0, active-sessions: u0 }
+        (map-get? student-session-count { student: caller })))
+    )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (get active tutor-data) ERR_NOT_FOUND)
+    (try! (stx-transfer? amount caller (as-contract tx-sender)))
+    
+    (map-set learning-sessions
+      { session-id: session-id }
+      {
+        student: caller,
+        tutor-id: tutor-id,
+        amount: amount,
+        description: description,
+        created-block: stacks-block-height,
+        completion-deadline: (+ stacks-block-height session-duration-blocks),
+        student-confirmed: false,
+        tutor-confirmed: false,
+        funds-released: false,
+        cancelled: false
+      }
+    )
+    
+    (map-set student-session-count
+      { student: caller }
+      {
+        total-sessions: (+ (get total-sessions current-student-data) u1),
+        active-sessions: (+ (get active-sessions current-student-data) u1)
+      }
+    )
+    
+    (var-set next-session-id (+ session-id u1))
+    (ok session-id)
+  )
+)
+
+(define-public (confirm-session-completion (session-id uint))
+  (let
+    (
+      (caller tx-sender)
+      (session-data (unwrap! (map-get? learning-sessions { session-id: session-id }) ERR_SESSION_NOT_FOUND))
+      (tutor-data (unwrap! (map-get? tutors { tutor-id: (get tutor-id session-data) }) ERR_NOT_FOUND))
+    )
+    (asserts! (not (get cancelled session-data)) ERR_SESSION_ALREADY_CANCELLED)
+    (asserts! (not (get funds-released session-data)) ERR_SESSION_ALREADY_COMPLETED)
+    (asserts! (or (is-eq caller (get student session-data)) 
+                  (is-eq caller (get address tutor-data))) ERR_NOT_AUTHORIZED)
+    
+    (map-set learning-sessions
+      { session-id: session-id }
+      (merge session-data
+        {
+          student-confirmed: (or (get student-confirmed session-data) (is-eq caller (get student session-data))),
+          tutor-confirmed: (or (get tutor-confirmed session-data) (is-eq caller (get address tutor-data)))
+        }
+      )
+    )
+    
+    (let
+      (
+        (updated-session (unwrap! (map-get? learning-sessions { session-id: session-id }) ERR_SESSION_NOT_FOUND))
+      )
+      (if (and (get student-confirmed updated-session) (get tutor-confirmed updated-session))
+        (begin
+          (try! (release-session-funds session-id))
+          (ok true)
+        )
+        (ok false)
+      )
+    )
+  )
+)
+
+(define-private (release-session-funds (session-id uint))
+  (let
+    (
+      (session-data (unwrap! (map-get? learning-sessions { session-id: session-id }) ERR_SESSION_NOT_FOUND))
+      (tutor-data (unwrap! (map-get? tutors { tutor-id: (get tutor-id session-data) }) ERR_NOT_FOUND))
+      (student-data (default-to { total-sessions: u0, active-sessions: u0 }
+        (map-get? student-session-count { student: (get student session-data) })))
+    )
+    (try! (stx-transfer? (get amount session-data) (as-contract tx-sender) (get address tutor-data)))
+    
+    (map-set learning-sessions
+      { session-id: session-id }
+      (merge session-data { funds-released: true })
+    )
+    
+    (map-set student-session-count
+      { student: (get student session-data) }
+      (merge student-data {
+        active-sessions: (if (> (get active-sessions student-data) u0) 
+                           (- (get active-sessions student-data) u1) u0)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-session (session-id uint))
+  (let
+    (
+      (caller tx-sender)
+      (session-data (unwrap! (map-get? learning-sessions { session-id: session-id }) ERR_SESSION_NOT_FOUND))
+      (student-data (default-to { total-sessions: u0, active-sessions: u0 }
+        (map-get? student-session-count { student: (get student session-data) })))
+    )
+    (asserts! (is-eq caller (get student session-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get funds-released session-data)) ERR_SESSION_ALREADY_COMPLETED)
+    (asserts! (not (get cancelled session-data)) ERR_SESSION_ALREADY_CANCELLED)
+    (asserts! (< stacks-block-height (get completion-deadline session-data)) ERR_PROPOSAL_ENDED)
+    
+    (try! (stx-transfer? (get amount session-data) (as-contract tx-sender) caller))
+    
+    (map-set learning-sessions
+      { session-id: session-id }
+      (merge session-data { cancelled: true })
+    )
+    
+    (map-set student-session-count
+      { student: caller }
+      (merge student-data {
+        active-sessions: (if (> (get active-sessions student-data) u0) 
+                           (- (get active-sessions student-data) u1) u0)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-learning-session (session-id uint))
+  (map-get? learning-sessions { session-id: session-id })
+)
+
+(define-read-only (get-student-session-stats (student principal))
+  (map-get? student-session-count { student: student })
 )
