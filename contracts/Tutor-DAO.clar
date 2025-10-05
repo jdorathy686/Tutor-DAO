@@ -22,6 +22,10 @@
 (define-constant ERR_INSUFFICIENT_ESCROW (err u118))
 (define-constant ERR_SESSION_NOT_READY (err u119))
 
+(define-constant ERR_ALREADY_SLASHED (err u120))
+(define-constant ERR_NOT_RESOLVED (err u121))
+(define-constant SLASH_AMOUNT u1000000)
+
 (define-data-var next-session-id uint u1)
 
 (define-data-var next-tutor-id uint u1)
@@ -729,4 +733,71 @@
 
 (define-read-only (get-student-session-stats (student principal))
   (map-get? student-session-count { student: student })
+)
+
+(define-map tutor-bonds
+  { tutor-id: uint }
+  { amount: uint }
+)
+
+(define-map dispute-penalties
+  { dispute-id: uint }
+  { slashed: bool }
+)
+
+(define-public (bond-tutor (tutor-id uint) (amount uint))
+  (let
+    (
+      (caller tx-sender)
+      (tutor (unwrap! (map-get? tutors { tutor-id: tutor-id }) ERR_NOT_FOUND))
+      (bond (default-to { amount: u0 } (map-get? tutor-bonds { tutor-id: tutor-id })))
+    )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-eq caller (get address tutor)) ERR_NOT_AUTHORIZED)
+    (try! (stx-transfer? amount caller (as-contract tx-sender)))
+    (map-set tutor-bonds { tutor-id: tutor-id } { amount: (+ (get amount bond) amount) })
+    (ok (get amount (unwrap! (map-get? tutor-bonds { tutor-id: tutor-id }) ERR_NOT_FOUND)))
+  )
+)
+
+(define-public (withdraw-bond (tutor-id uint) (amount uint))
+  (let
+    (
+      (caller tx-sender)
+      (tutor (unwrap! (map-get? tutors { tutor-id: tutor-id }) ERR_NOT_FOUND))
+      (bond (default-to { amount: u0 } (map-get? tutor-bonds { tutor-id: tutor-id })))
+    )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-eq caller (get address tutor)) ERR_NOT_AUTHORIZED)
+    (asserts! (>= (get amount bond) amount) ERR_INSUFFICIENT_BALANCE)
+    (try! (stx-transfer? amount (as-contract tx-sender) caller))
+    (map-set tutor-bonds { tutor-id: tutor-id } { amount: (- (get amount bond) amount) })
+    (ok true)
+  )
+)
+
+(define-public (slash-bond-on-dispute (dispute-id uint))
+  (let
+    (
+      (d (unwrap! (map-get? disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+      (already (map-get? dispute-penalties { dispute-id: dispute-id }))
+      (bond (default-to { amount: u0 } (map-get? tutor-bonds { tutor-id: (get tutor-id d) })))
+    )
+    (asserts! (get resolved d) ERR_NOT_RESOLVED)
+    (asserts! (is-none already) ERR_ALREADY_SLASHED)
+    (asserts! (> (get arbitrator-votes-for d) (get arbitrator-votes-against d)) ERR_NOT_AUTHORIZED)
+    (let
+      (
+        (amt (if (> (get amount bond) SLASH_AMOUNT) SLASH_AMOUNT (get amount bond)))
+      )
+      (try! (stx-transfer? amt (as-contract tx-sender) (get student d)))
+      (map-set tutor-bonds { tutor-id: (get tutor-id d) } { amount: (- (get amount bond) amt) })
+      (map-set dispute-penalties { dispute-id: dispute-id } { slashed: true })
+      (ok amt)
+    )
+  )
+)
+
+(define-read-only (get-tutor-bond (tutor-id uint))
+  (map-get? tutor-bonds { tutor-id: tutor-id })
 )
