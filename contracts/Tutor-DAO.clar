@@ -801,3 +801,111 @@
 (define-read-only (get-tutor-bond (tutor-id uint))
   (map-get? tutor-bonds { tutor-id: tutor-id })
 )
+
+(define-data-var next-leaderboard-id uint u1)
+
+(define-map leaderboard-entries
+  { leaderboard-id: uint }
+  {
+    tutor-id: uint,
+    performance-score: uint,
+    rank-position: uint,
+    last-updated: uint
+  }
+)
+
+(define-map tutor-leaderboard-position
+  { tutor-id: uint }
+  { leaderboard-id: uint }
+)
+
+(define-map subject-leaders
+  { subject: (string-ascii 30) }
+  { top-tutor-id: uint, top-score: uint }
+)
+
+(define-private (calculate-performance-score (tutor-id uint))
+  (let
+    (
+      (tutor (unwrap! (map-get? tutors { tutor-id: tutor-id }) u0))
+      (review-count (get review-count tutor))
+      (avg-rating (if (> review-count u0) 
+                     (/ (get total-rating tutor) review-count) u0))
+      (rewards-score (/ (get total-rewards tutor) u1000000))
+      (achievement-count (get-tutor-achievements tutor-id))
+    )
+    (+
+      (* avg-rating u100)
+      (* review-count u10)
+      rewards-score
+      (* achievement-count u50)
+    )
+  )
+)
+
+(define-public (update-leaderboard-position (tutor-id uint))
+  (let
+    (
+      (tutor (unwrap! (map-get? tutors { tutor-id: tutor-id }) ERR_NOT_FOUND))
+      (score (calculate-performance-score tutor-id))
+      (existing-entry (map-get? tutor-leaderboard-position { tutor-id: tutor-id }))
+      (leaderboard-id (match existing-entry
+                        entry (get leaderboard-id entry)
+                        (var-get next-leaderboard-id)))
+    )
+    (asserts! (get active tutor) ERR_NOT_FOUND)
+    
+    (map-set leaderboard-entries
+      { leaderboard-id: leaderboard-id }
+      {
+        tutor-id: tutor-id,
+        performance-score: score,
+        rank-position: u0,
+        last-updated: stacks-block-height
+      }
+    )
+    
+    (if (is-none existing-entry)
+      (begin
+        (map-set tutor-leaderboard-position
+          { tutor-id: tutor-id }
+          { leaderboard-id: leaderboard-id }
+        )
+        (var-set next-leaderboard-id (+ leaderboard-id u1))
+      )
+      true
+    )
+    (begin
+      (update-subject-leader tutor-id score (get subject tutor))
+      (ok score)
+    )
+  )
+)
+
+
+(define-private (update-subject-leader (tutor-id uint) (score uint) (subject (string-ascii 30)))
+  (let
+    (
+      (current-leader (map-get? subject-leaders { subject: subject }))
+    )
+    (match current-leader
+      leader (if (> score (get top-score leader))
+               (map-set subject-leaders { subject: subject }
+                 { top-tutor-id: tutor-id, top-score: score })
+               true)
+      (map-set subject-leaders { subject: subject }
+        { top-tutor-id: tutor-id, top-score: score })
+    )
+  )
+)
+
+(define-read-only (get-tutor-leaderboard-entry (tutor-id uint))
+  (match (map-get? tutor-leaderboard-position { tutor-id: tutor-id })
+    position (map-get? leaderboard-entries { leaderboard-id: (get leaderboard-id position) })
+    none
+  )
+)
+
+(define-read-only (get-subject-top-performer (subject (string-ascii 30)))
+  (map-get? subject-leaders { subject: subject })
+)
